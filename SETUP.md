@@ -5,8 +5,6 @@
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
-That's it. No Docker, no separate Postgres install.
-
 ## 1. Install dependencies
 
 ```bash
@@ -51,6 +49,18 @@ How you schema the database (a single `entity` table with a `type`
 column and `jsonb` data, one table per entity type, …) is your design
 call — we want to see your reasoning.
 
-## 4. Submit
+## 4. Browse the data (optional)
+
+```bash
+uv run python web.py
+```
+
+Opens [pgweb](https://github.com/sosedoff/pgweb) at http://localhost:8081
+pointed at the local database. Install pgweb first:
+
+- macOS:  `brew install pgweb`
+- other:  https://github.com/sosedoff/pgweb/releases
+
+## 5. Submit
 
 See `README.md` for what to commit alongside your code.
