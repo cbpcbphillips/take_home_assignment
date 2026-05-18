@@ -34,7 +34,7 @@ Design an ontology for Reznar's magic item catalog and populate it from the PDF.
 
 2. **An extraction pipeline** — a script or agent that reads the PDF and populates the local Postgres database. The source data is imperfect; your pipeline should handle that gracefully. We are an AI-first company and expect you to build AI tools.
 
-3. **A snapshot** — once your data is loaded, dump it so we can inspect it without rerunning the pipeline. A `pg_dump` or a JSON export of your tables is fine; commit it as e.g. `reznar.dump` or `reznar.json` at the repo root.
+3. **Run instructions** — clear, runnable steps so we can execute your extraction ourselves end-to-end. Add them to the README (or a `RUN.md`): how to install, what env vars / API keys to set, and the exact command(s) to populate the database from the PDF.
 
 ---
 
