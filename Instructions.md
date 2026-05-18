@@ -30,11 +30,20 @@ Using the Atlas tooling provided, design an ontology for Reznar's magic item cat
 
 3. **A snapshot** — once your data is loaded, export it:
    ```
-   python -m atlas export reznar --out reznar_snap.bin
+   uv run python -m atlas export reznar --out reznar_snap.bin
    ```
    Submit `reznar_snap.bin` alongside your code.
 
 ---
+
+### Note: What even is an ontology?
+Ontology is a philosophy term for 'things that exist', and like all philosophy terms there is a lot of *debate* about it. From a software perspective, ontology is the secret sauce that enables Palantir to be Palantir--a set of structured relationships between everything that can be traversed and queried. 
+* [Palantir docs](https://www.palantir.com/docs/foundry/ontology/overview)
+* [Casey Hart Youtube](https://www.youtube.com/watch?v=UW57RW-4kWs&list=PLIHlyoU28t5_gsMf8EkmnQVSHefbR3xqz)
+
+You can also think of it as a database schema. Formally, an ontology is just a bunch of triples, Subject -> Predicate -> Object, but in practical terms that is a pain to query. There's a lot of pre-existing practice, you may see acronyms  like OWL, BFO, and RDF. 
+
+At Mulholland, we move fast, so we build our ontologies in Pydantic. An example codebase is provided.
 
 ## Part 2 — Analysis Notebook
 

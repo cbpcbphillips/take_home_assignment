@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 .claude/scheduled_tasks.lock
 CONTEXT.md
+uv.lock
 
 # Terraform
 **/.terraform/

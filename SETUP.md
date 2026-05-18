@@ -4,17 +4,24 @@
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- Docker (Docker Desktop on Mac/Windows; Docker Engine on Linux)
+- Docker (Docker Desktop on Mac/Windows; Docker Engine + Compose plugin on Linux/WSL)
+  - Linux/WSL: `sudo apt-get install docker-compose-v2` if `docker compose version` returns an error
 
 ## 1. Install dependencies
 
 From the repo root:
 
 ```bash
-uv sync
+uv sync --all-packages
 ```
 
-This resolves dependencies and installs everything in editable mode, including generating a `uv.lock` on first run.
+This resolves dependencies and installs all workspace packages (atlas engine, reznar scaffold, and reference client) in editable mode.
+
+uv manages its own virtualenv — prefix Python commands with `uv run` (e.g. `uv run python`, `uv run python -m atlas`), or activate the venv once for your session:
+
+```bash
+source .venv/bin/activate
+```
 
 ## 2. Start Postgres
 
@@ -39,13 +46,7 @@ Add this to your shell profile or a `.env` file you source before running anythi
 ## 4. Verify
 
 ```bash
-python - <<'EOF'
-import atlas
-conn = atlas.connect()
-atlas.bootstrap(conn)
-print("atlas is ready")
-conn.close()
-EOF
+uv run python verify.py
 ```
 
 You should see `atlas is ready`. If you get a connection error, check that the container is running (`docker compose ps`) and that `ATLAS_DSN` is exported in your current shell.
@@ -61,7 +62,7 @@ See `clients/stormland/ontology.py` for a complete worked example.
 Once your data is loaded:
 
 ```bash
-python -m atlas export reznar --out reznar_snap.bin
+uv run python -m atlas export reznar --out reznar_snap.bin
 ```
 
 Submit `reznar_snap.bin` alongside your code.
