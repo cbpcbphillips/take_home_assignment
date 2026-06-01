@@ -22,7 +22,8 @@ dependencies = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = [".venv", "__pycache__"]
+extend-exclude = [".venv", "__pycache__","stormland/**","reznar/ontology.py"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
