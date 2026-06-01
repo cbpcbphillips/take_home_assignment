@@ -1,10 +1,28 @@
+# local environment
+.venv/
+.env
+
+# Python
 __pycache__/
 *.py[cod]
-.DS_Store
-.venv/
-uv.lock
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
 
-# Embedded Postgres data directory created by db.connect()
+# generated pipeline outputs
+data/pages/
+data/raw_extractions/
+data/assembled/
+data/validated/
+data/reports/
+
+# embedded Postgres created by db.connect()
 data/.pg/
 
-*.egg-info/
+# optional logs
+logs/
+*.log
+
+# OS/editor junk
+.DS_Store
+.idea/

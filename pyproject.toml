@@ -9,6 +9,14 @@ dependencies = [
     "python-stdnum>=2.2",
     "us>=3.2.0",
     "py-moneyed>=3.0",
+    "pymupdf>=1.27.2.3",
+    "pillow>=12.2.0",
+    "typer>=0.26.5",
+    "rich>=15.0.0",
+    "tenacity>=9.1.4",
+    "orjson>=3.11.9",
+    "python-dotenv>=1.2.2",
+    "openai>=2.38.0",
 ]
 
 [tool.ruff]
@@ -19,3 +27,9 @@ extend-exclude = [".venv", "__pycache__"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["E501"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.15",
+]
