@@ -5,10 +5,23 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import re
+import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Protocol
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 PAGE_EXTRACTION_PROMPT = """
 You are reading one page image from a fantasy magic item catalog.
@@ -140,6 +153,7 @@ class OpenAIVisionExtractor:
         )
 
         last_error: Exception | None = None
+        attempted_retry = False
         for _attempt in range(self.max_retries + 1):
             try:
                 response = self._client.responses.create(
@@ -150,7 +164,7 @@ class OpenAIVisionExtractor:
                             "role": "user",
                             "content": [
                                 {"type": "input_text", "text": user_text},
-                                {"type": "input_image", "image_url": data_url},
+                                {"type": "input_image", "image_url": data_url, "detail": "high"},
                             ],
                         }
                     ],
@@ -160,8 +174,18 @@ class OpenAIVisionExtractor:
                 return _response_output_text(response)
             except Exception as exc:
                 last_error = exc
+                if not _should_retry_openai_error(exc):
+                    break
+                if _attempt < self.max_retries:
+                    attempted_retry = True
+                    time.sleep(_retry_delay_seconds(exc, _attempt))
 
-        raise ModelClientError("OpenAI API call failed after retries.") from last_error
+        if last_error is None:
+            raise ModelClientError("OpenAI API call failed without an exception.")
+        failure = "OpenAI API call failed after retries" if attempted_retry else "OpenAI API call failed"
+        raise ModelClientError(
+            f"{failure}: {_format_exception_for_message(last_error)}"
+        ) from last_error
 
 
 def encode_image_base64(image_path: Path) -> str:
@@ -228,6 +252,106 @@ def _validate_raw_page_shape(result: dict[str, object]) -> None:
         raise ModelClientError("Model response 'items' must be a list.")
     if not isinstance(result["warnings"], list):
         raise ModelClientError("Model response 'warnings' must be a list.")
+
+
+def _should_retry_openai_error(exc: Exception) -> bool:
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+        return False
+    if _is_insufficient_quota_error(exc):
+        return False
+    if isinstance(exc, RateLimitError):
+        return True
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    if isinstance(exc, APIStatusError):
+        status_code = getattr(exc, "status_code", None)
+        return status_code in {408, 409, 429} or (
+            isinstance(status_code, int) and status_code >= 500
+        )
+    return isinstance(exc, APIError)
+
+
+def _is_insufficient_quota_error(exc: Exception) -> bool:
+    for value in _error_values(exc):
+        if str(value).strip().lower() == "insufficient_quota":
+            return True
+    return "insufficient_quota" in str(exc).lower()
+
+
+def _error_values(exc: Exception) -> list[object]:
+    values: list[object] = []
+    for attribute in ("code", "type"):
+        value = getattr(exc, attribute, None)
+        if value is not None:
+            values.append(value)
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        values.extend(_dict_values(body))
+    return values
+
+
+def _dict_values(data: dict[object, object]) -> list[object]:
+    values: list[object] = []
+    for value in data.values():
+        values.append(value)
+        if isinstance(value, dict):
+            values.extend(_dict_values(value))
+    return values
+
+
+def _retry_delay_seconds(exc: Exception, attempt: int) -> float:
+    retry_after = _retry_after_seconds(exc)
+    if retry_after is not None:
+        return retry_after
+    return min(60.0, 2.0**attempt)
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    value = _retry_after_header(exc)
+    if not value:
+        return None
+
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        seconds = (retry_at - datetime.now(UTC)).total_seconds()
+
+    return max(0.0, seconds)
+
+
+def _retry_after_header(exc: Exception) -> str | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        value = headers.get("retry-after") or headers.get("Retry-After")
+        if value is not None:
+            return str(value)
+
+    headers = getattr(exc, "headers", None)
+    if headers is not None:
+        value = headers.get("retry-after") or headers.get("Retry-After")
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _format_exception_for_message(exc: Exception) -> str:
+    message = _sanitize_error_message(str(exc).strip())
+    if not message:
+        message = "(no message)"
+    return f"{type(exc).__name__}: {message}"
+
+
+def _sanitize_error_message(message: str) -> str:
+    redacted = re.sub(r"sk-[A-Za-z0-9_-]+", "sk-[redacted]", message)
+    return re.sub(r"Bearer\s+\S+", "Bearer [redacted]", redacted, flags=re.IGNORECASE)
 
 
 def _response_output_text(response: object) -> str:

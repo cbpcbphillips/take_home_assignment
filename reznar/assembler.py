@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,50 @@ class AssemblyError(Exception):
 
 
 _JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS
+_RECOGNIZED_HEADER_STARTS = (
+    "wondrous item",
+    "wonderous item",
+    "weapon",
+    "armor",
+    "ring",
+    "potion",
+    "scroll",
+    "wand",
+    "staff",
+    "rod",
+)
+_CONTINUATION_STARTS = (
+    "after much deliberation",
+    "unfortunately",
+    "while the orcs",
+    "the powers of",
+    "eventually",
+    "the ring, however",
+    "this suit",
+    "in addition",
+)
+_SUSPICIOUS_HEADER_STARTS = (
+    "immunities",
+    "resistances",
+    "increased movement",
+    "increased appetite",
+    "destroying the drum",
+    "destroying the armor",
+    "destroying the ring",
+    "heightened senses",
+    "regeneration",
+    "increased ability scores",
+    "spellcasting",
+    "summon warriors",
+    "vulnerability",
+    "energy leech",
+)
+_KNOWN_REPAIR_RANGES = {
+    "exo armor": (7, 9),
+    "ring of elven lords": (22, 24),
+    "war drum of the horde": (29, 31),
+    "pouch of false coins": (34, 35),
+}
 
 
 def assembled_item_path(output_dir: Path, item_index: int) -> Path:
@@ -98,6 +143,95 @@ def assemble_items(page_extractions: list[dict[str, object]]) -> list[dict[str, 
     return assembled
 
 
+def repair_assembled_items(assembled_items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Merge obvious multi-page continuation records without mutating input records."""
+
+    sorted_items = [
+        item
+        for _, item in sorted(
+            ((index, copy.deepcopy(item)) for index, item in enumerate(assembled_items)),
+            key=lambda indexed_item: (_first_source_page(indexed_item[1]), indexed_item[0]),
+        )
+    ]
+
+    repaired: list[dict[str, object]] = []
+    for candidate in sorted_items:
+        if not isinstance(candidate, dict):
+            repaired.append(candidate)
+            continue
+
+        parent = repaired[-1] if repaired else None
+        if parent is not None and _should_merge_continuation(parent, candidate):
+            repaired[-1] = _merge_assembled_item(parent, candidate)
+        else:
+            repaired.append(candidate)
+
+    return repaired
+
+
+def find_suspicious_assembled_items(
+    assembled_items: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Return summary dictionaries for assembled items that need human review."""
+
+    name_counts: dict[str, int] = {}
+    for item in assembled_items:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalized_name(item.get("name_guess"))
+        if normalized:
+            name_counts[normalized] = name_counts.get(normalized, 0) + 1
+
+    suspicious: list[dict[str, object]] = []
+    for index, item in enumerate(assembled_items, start=1):
+        if not isinstance(item, dict):
+            suspicious.append(
+                {
+                    "index": index,
+                    "name_guess": None,
+                    "header_line": None,
+                    "source_pages": [],
+                    "reasons": ["record is not an object"],
+                }
+            )
+            continue
+
+        reasons: list[str] = []
+        name_guess = _optional_text(item.get("name_guess"))
+        header_line = _optional_text(item.get("header_line"))
+        raw_text = _optional_text(item.get("raw_text"))
+        source_pages = _source_pages_from_item(item)
+        normalized = _normalized_name(name_guess)
+
+        if normalized and name_counts.get(normalized, 0) > 1:
+            reasons.append("duplicate name_guess")
+        if not header_line or not _has_recognized_item_header(header_line):
+            reasons.append("unrecognized header_line")
+        if len(source_pages) > 1:
+            reasons.append("multi-page source_pages")
+        if item.get("needs_review") is True:
+            reasons.append("needs_review=True")
+        if any(_mentions_repair_or_continuation(warning) for warning in _warnings_from_item(item)):
+            reasons.append("repair/continuation warning")
+        if not name_guess:
+            reasons.append("blank or missing name_guess")
+        if not raw_text:
+            reasons.append("blank or missing raw_text")
+
+        if reasons:
+            suspicious.append(
+                {
+                    "index": index,
+                    "name_guess": name_guess,
+                    "header_line": header_line,
+                    "source_pages": source_pages,
+                    "reasons": reasons,
+                }
+            )
+
+    return suspicious
+
+
 def save_assembled_items(
     assembled_items: list[dict[str, object]],
     output_dir: Path,
@@ -128,6 +262,9 @@ def save_assembled_items(
             raise AssemblyError(f"Failed to save assembled item JSON at {path}.") from exc
         saved_paths.append(path)
 
+    if force:
+        _delete_stale_assembled_items(target_dir, len(saved_paths))
+
     return saved_paths
 
 
@@ -157,6 +294,269 @@ def assemble_items_from_config(
     if save:
         save_assembled_items(assembled, config.assembled_dir, force=force)
     return assembled
+
+
+def _should_merge_continuation(
+    parent: dict[str, object],
+    candidate: dict[str, object],
+) -> bool:
+    parent_pages = _source_pages_from_item(parent)
+    candidate_pages = _source_pages_from_item(candidate)
+    if not parent_pages or not candidate_pages:
+        return False
+
+    parent_last_page = max(parent_pages)
+    candidate_first_page = min(candidate_pages)
+    if candidate_first_page <= parent_last_page:
+        return False
+
+    page_gap = candidate_first_page - parent_last_page
+    if page_gap > 2:
+        return False
+
+    if _is_clear_distinct_item(parent, candidate):
+        return False
+
+    parent_name = _normalized_name(parent.get("name_guess"))
+    candidate_name = _normalized_name(candidate.get("name_guess"))
+    same_name = bool(parent_name and candidate_name and parent_name == candidate_name)
+    known_range = _known_repair_range_matches(parent, candidate_first_page)
+    suspicious_candidate = _is_suspicious_continuation_candidate(candidate)
+    continuation_start = _has_continuation_start(candidate)
+    likely_long_parent = _is_likely_long_form_item(parent)
+
+    if same_name and (known_range or likely_long_parent or suspicious_candidate):
+        return True
+    if known_range and (same_name or suspicious_candidate or continuation_start):
+        return True
+    if page_gap == 1 and likely_long_parent and (suspicious_candidate or continuation_start):
+        return True
+    return False
+
+
+def _is_clear_distinct_item(parent: dict[str, object], candidate: dict[str, object]) -> bool:
+    parent_name = _normalized_name(parent.get("name_guess"))
+    candidate_name = _normalized_name(candidate.get("name_guess"))
+    if not candidate_name or candidate_name == parent_name:
+        return False
+    return _has_recognized_item_header(_optional_text(candidate.get("header_line")))
+
+
+def _known_repair_range_matches(parent: dict[str, object], candidate_first_page: int) -> bool:
+    parent_name = _normalized_name(parent.get("name_guess"))
+    if not parent_name:
+        return False
+    page_range = _KNOWN_REPAIR_RANGES.get(parent_name)
+    if page_range is None:
+        return False
+    start_page, end_page = page_range
+    return start_page <= candidate_first_page <= end_page
+
+
+def _is_suspicious_continuation_candidate(item: dict[str, object]) -> bool:
+    header_line = _optional_text(item.get("header_line"))
+    if not header_line:
+        return True
+
+    normalized_header = _normalize_text(header_line)
+    if any(normalized_header.startswith(value) for value in _SUSPICIOUS_HEADER_STARTS):
+        return True
+    if not _has_recognized_item_header(header_line):
+        return True
+    return False
+
+
+def _has_recognized_item_header(header_line: str | None) -> bool:
+    if not header_line:
+        return False
+    normalized_header = _normalize_text(header_line)
+    return any(normalized_header.startswith(value) for value in _RECOGNIZED_HEADER_STARTS)
+
+
+def _has_continuation_start(item: dict[str, object]) -> bool:
+    raw_text = _optional_text(item.get("raw_text"))
+    if not raw_text:
+        return True
+    normalized_text = _normalize_text(raw_text)
+    if any(normalized_text.startswith(value) for value in _CONTINUATION_STARTS):
+        return True
+    return any(normalized_text.startswith(value) for value in _SUSPICIOUS_HEADER_STARTS)
+
+
+def _is_likely_long_form_item(item: dict[str, object]) -> bool:
+    header_line = _optional_text(item.get("header_line")) or ""
+    raw_text = _optional_text(item.get("raw_text")) or ""
+    normalized = _normalize_text(f"{header_line} {raw_text}")
+    fragments = _fragments_from_item(item)
+
+    return (
+        "artifact" in normalized
+        or len(raw_text) > 900
+        or len(_source_pages_from_item(item)) > 1
+        or any(fragment.get("continues_to_next_page") is True for fragment in fragments)
+        or any(
+            phrase in normalized
+            for phrase in (
+                "ages past",
+                "crafted eons",
+                "centuries ago",
+                "orc horde",
+                "elven lands",
+                "foreign land",
+                "village",
+            )
+        )
+    )
+
+
+def _merge_assembled_item(
+    parent: dict[str, object],
+    candidate: dict[str, object],
+) -> dict[str, object]:
+    merged = copy.deepcopy(parent)
+    child_name = _optional_text(candidate.get("name_guess"))
+    child_header = _optional_text(candidate.get("header_line"))
+
+    if _optional_text(merged.get("name_guess")) is None and child_name is not None:
+        merged["name_guess"] = child_name
+    if _optional_text(merged.get("header_line")) is None and child_header is not None:
+        merged["header_line"] = child_header
+
+    fragments = _fragments_from_item(parent) + _fragments_from_item(candidate)
+    merged["fragments"] = copy.deepcopy(fragments)
+    merged_pages = sorted(
+        set(
+            _source_pages_from_item(parent)
+            + _source_pages_from_item(candidate)
+            + _source_pages_from_fragments(fragments)
+        )
+    )
+    if len(merged_pages) > 1:
+        merged_pages = list(range(min(merged_pages), max(merged_pages) + 1))
+    merged["source_pages"] = merged_pages
+
+    merged["raw_text"] = "\n\n".join(_raw_text_parts(parent) + _raw_text_parts(candidate))
+    merged["needs_review"] = True
+    merged["warnings"] = _warnings_from_item(parent)
+    _add_warnings(
+        merged,
+        _warnings_from_item(candidate)
+        + [
+            (
+                "Repair: merged continuation record "
+                f"{child_name or '(unnamed)'} from page(s) "
+                f"{_source_pages_from_item(candidate)} into "
+                f"{_optional_text(parent.get('name_guess')) or '(unnamed parent)'}."
+            )
+        ],
+    )
+    return merged
+
+
+def _source_pages_from_item(item: object) -> list[int]:
+    if not isinstance(item, dict):
+        return []
+
+    pages = item.get("source_pages")
+    if isinstance(pages, list):
+        valid_pages = [
+            page for page in pages if isinstance(page, int) and not isinstance(page, bool) and page > 0
+        ]
+        if valid_pages:
+            return sorted(set(valid_pages))
+
+    return _source_pages_from_fragments(_fragments_from_item(item))
+
+
+def _source_pages_from_fragments(fragments: list[dict[str, object]]) -> list[int]:
+    pages: list[int] = []
+    for fragment in fragments:
+        page = fragment.get("page_number")
+        if isinstance(page, int) and not isinstance(page, bool) and page > 0:
+            pages.append(page)
+    return sorted(set(pages))
+
+
+def _first_source_page(item: object) -> int:
+    pages = _source_pages_from_item(item)
+    if not pages:
+        return 10**9
+    return min(pages)
+
+
+def _fragments_from_item(item: dict[str, object]) -> list[dict[str, object]]:
+    fragments = item.get("fragments")
+    if isinstance(fragments, list):
+        return [copy.deepcopy(fragment) for fragment in fragments if isinstance(fragment, dict)]
+
+    declared_pages = item.get("source_pages")
+    page = 0
+    if isinstance(declared_pages, list):
+        valid_pages = [
+            value
+            for value in declared_pages
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        ]
+        if valid_pages:
+            page = min(valid_pages)
+    fragment: dict[str, object] = {
+        "page_number": page,
+        "name": _optional_text(item.get("name_guess")),
+        "header_line": _optional_text(item.get("header_line")),
+        "raw_text": _optional_text(item.get("raw_text")) or "",
+        "continues_from_previous_page": False,
+        "continues_to_next_page": False,
+    }
+    return [fragment]
+
+
+def _raw_text_parts(item: dict[str, object]) -> list[str]:
+    raw_text = _optional_text(item.get("raw_text"))
+    if raw_text:
+        return [raw_text]
+
+    parts: list[str] = []
+    for fragment in _fragments_from_item(item):
+        text = _optional_text(fragment.get("raw_text"))
+        if text:
+            parts.append(text)
+    return parts
+
+
+def _warnings_from_item(item: dict[str, object]) -> list[str]:
+    warnings = item.get("warnings")
+    if not isinstance(warnings, list):
+        return []
+    return [text for warning in warnings if (text := str(warning).strip())]
+
+
+def _mentions_repair_or_continuation(warning: object) -> bool:
+    normalized = _normalize_text(str(warning))
+    return "repair" in normalized or "continuation" in normalized or "continues" in normalized
+
+
+def _normalized_name(value: object) -> str:
+    text = _optional_text(value)
+    if text is None:
+        return ""
+    return _normalize_text(text)
+
+
+def _normalize_text(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split())
+
+
+def _delete_stale_assembled_items(output_dir: Path, saved_count: int) -> None:
+    pattern = re.compile(r"^item_(\d+)\.json$")
+    for path in output_dir.glob("item_*.json"):
+        match = pattern.match(path.name)
+        if match is None or int(match.group(1)) <= saved_count:
+            continue
+        _validate_output_path(path, output_dir)
+        try:
+            path.unlink()
+        except Exception as exc:
+            raise AssemblyError(f"Failed to delete stale assembled item JSON at {path}.") from exc
 
 
 def _validate_page_extraction(page: dict[str, object]) -> dict[str, Any]:
@@ -319,6 +719,8 @@ __all__ = [
     "assemble_items",
     "assemble_items_from_config",
     "assembled_item_path",
+    "find_suspicious_assembled_items",
     "load_assembled_item",
+    "repair_assembled_items",
     "save_assembled_items",
 ]

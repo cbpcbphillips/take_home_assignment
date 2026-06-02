@@ -34,11 +34,16 @@ def main() -> None:
 
     with db.connect() as conn:
         info = conn.info
+        host = info.host
+        if not host or "/" in host or "\\" in host:
+            host = "127.0.0.1"
+        user = urllib.parse.quote(info.user or "", safe="")
+        dbname = urllib.parse.quote(info.dbname or "", safe="")
         url = (
-            f"postgres://{info.user}@/{info.dbname}"
-            f"?host={urllib.parse.quote(info.host, safe='')}"
-            f"&sslmode=disable"
+            f"postgres://{user}@{host}:{info.port}/{dbname}"
+            f"?sslmode=disable"
         )
+        print(f"database -> host={host} port={info.port} dbname={info.dbname}")
 
     print(f"pgweb -> http://localhost:{args.port}")
     subprocess.run([pgweb, "--url", url, "--listen", args.port], check=False)
