@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -20,8 +20,17 @@ from reznar.assembler import (
     save_assembled_items,
 )
 from reznar.config import PipelineConfig, ensure_output_dirs, load_config
-from reznar.extractor import PageExtractionResult, extract_pages_from_config, load_raw_extraction
-from reznar.mapper import map_assembled_item
+from reznar.extractor import (
+    PageExtractionResult,
+    extract_pages_from_config,
+    load_raw_extraction,
+)
+from reznar.mapper import (
+    DeterministicFallbackMapper,
+    OntologyMapper,
+    OpenAIOntologyMapper,
+    map_assembled_items_with_mapper,
+)
 from reznar.model_client import MockVisionExtractor, OpenAIVisionExtractor, VisionExtractor
 from reznar.render_pages import PageRenderResult, render_pages_from_config
 from reznar.validator import ValidationResult, validate_mapped_item
@@ -30,6 +39,14 @@ PIPELINE_VERSION = "module-11"
 
 app = typer.Typer(help="Reznar PDF extraction pipeline.")
 console = Console()
+
+
+@dataclass(frozen=True, slots=True)
+class MappingValidationRun:
+    validation_results: list[ValidationResult]
+    mapper_fallback_count: int
+    mapping_mode: str
+    real_mapper: bool
 
 
 @app.command("init-db")
@@ -156,11 +173,18 @@ def validate_command(
         bool,
         typer.Option("--repair-assembly/--no-repair-assembly"),
     ] = True,
+    real_mapper: Annotated[bool, typer.Option("--real-mapper/--no-real-mapper")] = False,
+    mapper_delay_seconds: Annotated[float, typer.Option("--mapper-delay-seconds")] = 1.0,
+    fallback_on_mapper_error: Annotated[
+        bool,
+        typer.Option("--fallback-on-mapper-error/--no-fallback-on-mapper-error"),
+    ] = True,
 ) -> None:
     """Map assembled item JSON and validate against the ontology."""
 
     try:
         config = load_config()
+        _validate_mapper_delay_seconds(mapper_delay_seconds)
         initial_assembled_items = _load_assembled_items(config)
         assembled_items = _repair_assembled_items_if_enabled(
             initial_assembled_items,
@@ -170,14 +194,24 @@ def validate_command(
             initial_count=len(initial_assembled_items),
             assembled_items=assembled_items,
         )
-        validation_results = _map_and_validate_items(assembled_items)
-        summary = _summarize_validation_results(validation_results)
+        mapping_run = _map_and_validate_items(
+            config,
+            assembled_items,
+            real_mapper=real_mapper,
+            mapper_delay_seconds=mapper_delay_seconds,
+            fallback_on_mapper_error=fallback_on_mapper_error,
+        )
+        summary = _summarize_validation_results(mapping_run.validation_results)
 
         if store:
             repository.init_db()
-            for validation_result in validation_results:
+            for validation_result in mapping_run.validation_results:
                 repository.insert_validation_result(None, validation_result)
 
+        _print_mapping_summary(
+            mapping_run=mapping_run,
+            assembled_item_count=len(assembled_items),
+        )
         console.print(f"Assembled items: [bold]{len(assembled_items)}[/]")
         console.print(f"Valid entities: [bold]{summary['valid_entities']}[/]")
         console.print(f"Validation errors: [bold]{summary['validation_errors']}[/]")
@@ -193,11 +227,18 @@ def load_command(
         bool,
         typer.Option("--repair-assembly/--no-repair-assembly"),
     ] = True,
+    real_mapper: Annotated[bool, typer.Option("--real-mapper/--no-real-mapper")] = False,
+    mapper_delay_seconds: Annotated[float, typer.Option("--mapper-delay-seconds")] = 1.0,
+    fallback_on_mapper_error: Annotated[
+        bool,
+        typer.Option("--fallback-on-mapper-error/--no-fallback-on-mapper-error"),
+    ] = True,
 ) -> None:
     """Validate assembled items and load valid entities into canonical tables."""
 
     try:
         config = load_config()
+        _validate_mapper_delay_seconds(mapper_delay_seconds)
         initial_assembled_items = _load_assembled_items(config)
         assembled_items = _repair_assembled_items_if_enabled(
             initial_assembled_items,
@@ -207,10 +248,23 @@ def load_command(
             initial_count=len(initial_assembled_items),
             assembled_items=assembled_items,
         )
-        validation_results = _map_and_validate_items(assembled_items)
+        mapping_run = _map_and_validate_items(
+            config,
+            assembled_items,
+            real_mapper=real_mapper,
+            mapper_delay_seconds=mapper_delay_seconds,
+            fallback_on_mapper_error=fallback_on_mapper_error,
+        )
         repository.init_db()
-        load_results = [loader.load_validation_result(result) for result in validation_results]
+        load_results = [
+            loader.load_validation_result(result) for result in mapping_run.validation_results
+        ]
+        _print_mapping_summary(
+            mapping_run=mapping_run,
+            assembled_item_count=len(assembled_items),
+        )
         _print_load_summary(load_results)
+        _print_real_mapper_related_warning(mapping_run, load_results)
     except Exception as exc:
         _exit_with_error(exc)
 
@@ -226,6 +280,12 @@ def run_command(
     repair_assembly: Annotated[
         bool,
         typer.Option("--repair-assembly/--no-repair-assembly"),
+    ] = True,
+    real_mapper: Annotated[bool, typer.Option("--real-mapper/--no-real-mapper")] = False,
+    mapper_delay_seconds: Annotated[float, typer.Option("--mapper-delay-seconds")] = 1.0,
+    fallback_on_mapper_error: Annotated[
+        bool,
+        typer.Option("--fallback-on-mapper-error/--no-fallback-on-mapper-error"),
     ] = True,
     continue_on_error: Annotated[
         bool | None,
@@ -243,6 +303,7 @@ def run_command(
         config = _config_with_max_pages(load_config(), max_pages)
         continue_after_page_errors = _resolve_continue_on_error(real_api, continue_on_error)
         request_delay = _resolve_request_delay_seconds(real_api, request_delay_seconds)
+        _validate_mapper_delay_seconds(mapper_delay_seconds)
         ensure_output_dirs(config)
 
         if not skip_db:
@@ -287,10 +348,16 @@ def run_command(
         if not skip_db:
             repository.insert_assembled_items_raw(run_id, assembled_items)
 
-        validation_results = _map_and_validate_items(assembled_items)
+        mapping_run = _map_and_validate_items(
+            config,
+            assembled_items,
+            real_mapper=real_mapper,
+            mapper_delay_seconds=mapper_delay_seconds,
+            fallback_on_mapper_error=fallback_on_mapper_error,
+        )
         load_results: list[loader.LoadResult] = []
         if not skip_db:
-            for validation_result in validation_results:
+            for validation_result in mapping_run.validation_results:
                 repository.insert_validation_result(run_id, validation_result)
                 load_results.append(loader.load_validation_result(validation_result))
             repository.finish_extraction_run(run_id, status="completed")
@@ -299,7 +366,7 @@ def run_command(
             rendered_pages=rendered_pages,
             page_results=page_results,
             assembled_items=assembled_items,
-            validation_results=validation_results,
+            mapping_run=mapping_run,
             load_results=load_results,
             skip_db=skip_db,
             error_dir=config.raw_extractions_dir / "errors",
@@ -397,6 +464,12 @@ def _make_vision_extractor(config: PipelineConfig, *, real_api: bool) -> VisionE
     return MockVisionExtractor()
 
 
+def _make_ontology_mapper(config: PipelineConfig, *, real_mapper: bool) -> OntologyMapper:
+    if real_mapper:
+        return OpenAIOntologyMapper.from_config(config)
+    return DeterministicFallbackMapper()
+
+
 def _repair_assembled_items_if_enabled(
     assembled_items: list[dict[str, object]],
     *,
@@ -448,6 +521,11 @@ def _resolve_request_delay_seconds(real_api: bool, value: float | None) -> float
     return delay
 
 
+def _validate_mapper_delay_seconds(value: float) -> None:
+    if value < 0:
+        raise typer.BadParameter("--mapper-delay-seconds must be non-negative.")
+
+
 def _successful_page_results(
     page_results: list[PageExtractionResult],
 ) -> list[PageExtractionResult]:
@@ -475,15 +553,127 @@ def _print_extract_summary(
         console.print(f"[yellow]Page error JSON directory: {raw_extractions_dir / 'errors'}[/]")
 
 
-def _map_and_validate_items(assembled_items: list[dict[str, object]]) -> list[ValidationResult]:
+def _map_and_validate_items(
+    config: PipelineConfig,
+    assembled_items: list[dict[str, object]],
+    *,
+    real_mapper: bool,
+    mapper_delay_seconds: float,
+    fallback_on_mapper_error: bool,
+) -> MappingValidationRun:
+    _validate_mapper_delay_seconds(mapper_delay_seconds)
+    mapper = _make_ontology_mapper(config, real_mapper=real_mapper)
+    fallback_mapper: OntologyMapper | None = None
+    if real_mapper and fallback_on_mapper_error:
+        fallback_mapper = DeterministicFallbackMapper()
+
+    mapping_mode = "real mapper" if real_mapper else "deterministic"
+    try:
+        mapped_items = map_assembled_items_with_mapper(
+            assembled_items,
+            mapper,
+            continue_on_error=True,
+            fallback_mapper=fallback_mapper,
+            delay_seconds=mapper_delay_seconds if real_mapper else 0.0,
+        )
+    except Exception as exc:
+        raise typer.BadParameter(f"Failed to map assembled items: {exc}") from exc
+
     validation_results: list[ValidationResult] = []
-    for index, assembled_item in enumerate(assembled_items, start=1):
+    for index, mapped_item in enumerate(mapped_items, start=1):
         try:
-            mapped_item = map_assembled_item(assembled_item)
             validation_results.append(validate_mapped_item(mapped_item))
         except Exception as exc:
             raise typer.BadParameter(f"Failed to map/validate assembled item {index}: {exc}") from exc
-    return validation_results
+    return MappingValidationRun(
+        validation_results=validation_results,
+        mapper_fallback_count=_mapper_fallback_count(mapped_items),
+        mapping_mode=mapping_mode,
+        real_mapper=real_mapper,
+    )
+
+
+def _mapper_fallback_count(mapped_items: list[dict[str, object]]) -> int:
+    fallback_warnings = {
+        "AI ontology mapping failed; deterministic fallback used.",
+        "AI related entity mapping failed; deterministic MagicItem only.",
+    }
+    count = 0
+    for mapped_item in mapped_items:
+        magic_item = mapped_item.get("MagicItem")
+        if not isinstance(magic_item, dict):
+            continue
+        extraction = magic_item.get("extraction")
+        if not isinstance(extraction, dict):
+            continue
+        warnings = extraction.get("warnings")
+        if isinstance(warnings, list) and any(warning in warnings for warning in fallback_warnings):
+            count += 1
+    return count
+
+
+def _print_mapping_summary(
+    *,
+    mapping_run: MappingValidationRun,
+    assembled_item_count: int,
+) -> None:
+    summary = _summarize_validation_results(mapping_run.validation_results)
+    console.print(f"Mapping mode: [bold]{mapping_run.mapping_mode}[/]")
+    console.print(f"Assembled item count: [bold]{assembled_item_count}[/]")
+    console.print(f"Mapper fallback count: [bold]{mapping_run.mapper_fallback_count}[/]")
+    console.print(f"Valid entities: [bold]{summary['valid_entities']}[/]")
+    console.print(f"Validation errors: [bold]{summary['validation_errors']}[/]")
+    _print_type_counts(
+        "Valid entities by type",
+        _valid_entity_type_counts(mapping_run.validation_results),
+    )
+    _print_type_counts(
+        "Validation errors by type",
+        _validation_error_type_counts(mapping_run.validation_results),
+    )
+
+
+def _valid_entity_type_counts(results: list[ValidationResult]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        for entity in result.valid_entities:
+            counts[entity.entity_type] = counts.get(entity.entity_type, 0) + 1
+    return counts
+
+
+def _validation_error_type_counts(results: list[ValidationResult]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        for error in result.errors:
+            counts[error.entity_type] = counts.get(error.entity_type, 0) + 1
+    return counts
+
+
+def _print_type_counts(title: str, counts: dict[str, int]) -> None:
+    if not counts:
+        console.print(f"{title}: [bold]0[/]")
+        return
+
+    table = Table(title=title)
+    table.add_column("Entity type")
+    table.add_column("Count", justify="right")
+    for entity_type, count in sorted(counts.items()):
+        table.add_row(entity_type, str(count))
+    console.print(table)
+
+
+def _print_real_mapper_related_warning(
+    mapping_run: MappingValidationRun,
+    load_results: list[loader.LoadResult],
+) -> None:
+    if not mapping_run.real_mapper:
+        return
+    if _loaded_related_item_entity_count(load_results) == 0:
+        console.print("[yellow]Real mapper produced no loadable related entities.[/]")
+
+
+def _loaded_related_item_entity_count(load_results: list[loader.LoadResult]) -> int:
+    return sum(len(result.item_entity_ids) for result in load_results)
 
 
 def _summarize_validation_results(results: list[ValidationResult]) -> dict[str, int]:
@@ -522,7 +712,7 @@ def _print_run_summary(
     page_results: list[PageExtractionResult],
     assembled_items: list[dict[str, object]],
     initial_assembled_count: int,
-    validation_results: list[ValidationResult],
+    mapping_run: MappingValidationRun,
     load_results: list[loader.LoadResult],
     skip_db: bool,
     error_dir: Path,
@@ -530,7 +720,6 @@ def _print_run_summary(
     successful_pages = _successful_page_results(page_results)
     cached_pages = sum(1 for result in successful_pages if result.from_cache)
     failed_pages = len(page_results) - len(successful_pages)
-    validation_summary = _summarize_validation_results(validation_results)
     console.print("[bold]Pipeline complete.[/]")
     console.print(f"Rendered/reused pages: [bold]{len(rendered_pages)}[/]")
     console.print(f"Successful raw pages: [bold]{len(successful_pages)}[/]")
@@ -540,13 +729,15 @@ def _print_run_summary(
         initial_count=initial_assembled_count,
         assembled_items=assembled_items,
     )
-    console.print(f"Assembled items: [bold]{len(assembled_items)}[/]")
-    console.print(f"Valid entities: [bold]{validation_summary['valid_entities']}[/]")
-    console.print(f"Validation errors: [bold]{validation_summary['validation_errors']}[/]")
+    _print_mapping_summary(
+        mapping_run=mapping_run,
+        assembled_item_count=len(assembled_items),
+    )
     if skip_db:
         console.print("Database steps skipped.")
     else:
         _print_load_summary(load_results)
+        _print_real_mapper_related_warning(mapping_run, load_results)
     if failed_pages:
         console.print(
             f"[yellow]Warning: {failed_pages} page(s) failed extraction. "
